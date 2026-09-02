@@ -9,3 +9,6 @@ htmlcov/
 *.db-shm
 *.db-wal
 .vscode/
+agent-state/
+artifact-data-a/
+artifact-data-b/
