@@ -5,7 +5,7 @@ K8S_DIR = Path("k8s")
 
 
 def test_kubernetes_manifests_cover_platform_and_customer_namespaces() -> None:
-    namespaces = (K8S_DIR / "namespaces.yaml").read_text(encoding="utf-8")
+    namespaces = (K8S_DIR / "00-namespaces.yaml").read_text(encoding="utf-8")
     platform = (K8S_DIR / "platform.yaml").read_text(encoding="utf-8")
     customer_a = (K8S_DIR / "customer-a.yaml").read_text(encoding="utf-8")
     customer_b = (K8S_DIR / "customer-b.yaml").read_text(encoding="utf-8")
