@@ -64,6 +64,11 @@ class RolloutCoordinator:
         else:
             target.desired_version = version
 
+        state = session.get(models.CustomerConfigState, (customer, config_name))
+        if state is not None:
+            state.status = "pending"
+            state.error = None
+
     def _wait_for_customer(
         self,
         customer: str,
