@@ -3,8 +3,10 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from prometheus_client import CONTENT_TYPE_LATEST
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -16,6 +18,7 @@ from control_plane.artifact_store import (
     ReplicatedArtifactStore,
 )
 from control_plane.database import Base, create_database, session_scope
+from control_plane.metrics import ConfigSyncMetrics
 from control_plane.rollout import RolloutConflict, RolloutCoordinator
 from control_plane.schemas import (
     ConfigCreate,
@@ -44,12 +47,16 @@ def create_app(
         "CONFIGSYNC_DATABASE_URL",
         DEFAULT_DATABASE_URL,
     )
-    resolved_artifact_store = artifact_store or ReplicatedArtifactStore.from_environment()
+    metrics = ConfigSyncMetrics()
+    resolved_artifact_store = artifact_store or ReplicatedArtifactStore.from_environment(
+        error_callback=metrics.record_storage_error
+    )
     engine, session_factory = create_database(resolved_database_url)
     rollout_coordinator = RolloutCoordinator(
         session_factory,
         timeout_seconds=rollout_timeout_seconds,
         poll_interval_seconds=rollout_poll_interval_seconds,
+        metrics=metrics,
     )
 
     @asynccontextmanager
@@ -59,6 +66,7 @@ def create_app(
         engine.dispose()
 
     app = FastAPI(title="ConfigSync Control Plane", lifespan=lifespan)
+    app.state.metrics = metrics
 
     def get_session() -> Iterator[Session]:
         yield from session_scope(session_factory)
@@ -124,6 +132,36 @@ def create_app(
             session.refresh(desired)
         return desired
 
+    def customer_desired_version(
+        session: Session,
+        customer: str,
+        config: models.Config,
+    ) -> int:
+        target = session.get(models.CustomerConfigTarget, (customer, config.name))
+        if target is not None:
+            return target.desired_version
+        return get_stable_state(session, config).stable_version
+
+    def update_sync_lag_metric(
+        session: Session,
+        customer: str,
+        config: models.Config,
+        applied_version: int,
+        report_status: str,
+    ) -> None:
+        desired_version = customer_desired_version(session, customer, config)
+        lag = 0.0
+        if report_status != "synced" or applied_version != desired_version:
+            desired_record = get_version_record(session, config.name, desired_version)
+            created_at = desired_record.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            lag = max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds())
+        metrics.agent_sync_lag_seconds.labels(
+            customer=customer,
+            config_name=config.name,
+        ).set(lag)
+
     def to_response(name: str, version: models.ConfigVersion) -> ConfigResponse:
         return ConfigResponse(
             name=name,
@@ -156,6 +194,10 @@ def create_app(
             created_at=rollout.created_at,
             updated_at=rollout.updated_at,
         )
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics() -> Response:
+        return Response(content=metrics.render(), media_type=CONTENT_TYPE_LATEST)
 
     @app.post(
         "/configs/{name}",
@@ -297,12 +339,7 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Configuration '{name}' was not found",
             )
-
-        target = session.get(models.CustomerConfigTarget, (customer, name))
-        if target is not None:
-            desired_version = target.desired_version
-        else:
-            desired_version = get_stable_state(session, config).stable_version
+        desired_version = customer_desired_version(session, customer, config)
         return to_response(
             name,
             get_version_record(session, name, desired_version),
@@ -319,7 +356,8 @@ def create_app(
         session: Session = Depends(get_session),
     ) -> CustomerStateResponse:
         """Record the actual state most recently observed by a customer agent."""
-        if session.get(models.Config, name) is None:
+        config = session.get(models.Config, name)
+        if config is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Configuration '{name}' was not found",
@@ -342,6 +380,13 @@ def create_app(
 
         session.commit()
         session.refresh(state_record)
+        update_sync_lag_metric(
+            session,
+            customer,
+            config,
+            payload.applied_version,
+            payload.status,
+        )
         return to_customer_state_response(state_record)
 
     @app.get(

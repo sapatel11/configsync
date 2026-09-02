@@ -85,6 +85,11 @@ def test_canary_rollout_advances_customer_b_only_after_customer_a(tmp_path: Path
             "/customers/customer-b/configs/firewall/desired"
         ).json()["version"] == 2
 
+        metrics = client.get("/metrics").text
+        assert "rollouts_total 1.0" in metrics
+        assert "rollout_failures_total 0.0" in metrics
+        assert "rollbacks_total 0.0" in metrics
+
 
 def test_failed_canary_restores_previous_desired_version(tmp_path: Path) -> None:
     app = create_app(
@@ -135,3 +140,8 @@ def test_failed_canary_restores_previous_desired_version(tmp_path: Path) -> None
         ).json()
         assert status_a["applied_version"] == 1
         assert status_a["status"] == "synced"
+
+        metrics = client.get("/metrics").text
+        assert "rollouts_total 1.0" in metrics
+        assert "rollout_failures_total 1.0" in metrics
+        assert "rollbacks_total 1.0" in metrics
