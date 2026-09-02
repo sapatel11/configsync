@@ -45,3 +45,21 @@ class ConfigVersion(Base):
         default=utc_now,
     )
     config: Mapped[Config] = relationship(back_populates="versions")
+
+
+class CustomerConfigState(Base):
+    """Last actual configuration state reported by a customer agent."""
+
+    __tablename__ = "customer_config_states"
+
+    customer: Mapped[str] = mapped_column(String(120), primary_key=True)
+    config_name: Mapped[str] = mapped_column(String(120), primary_key=True)
+    applied_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )

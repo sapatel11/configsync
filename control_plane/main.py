@@ -16,7 +16,13 @@ from control_plane.artifact_store import (
     ReplicatedArtifactStore,
 )
 from control_plane.database import Base, create_database, session_scope
-from control_plane.schemas import ConfigCreate, ConfigResponse, ConfigUpdate
+from control_plane.schemas import (
+    ConfigCreate,
+    ConfigResponse,
+    ConfigUpdate,
+    CustomerStateResponse,
+    CustomerStateUpdate,
+)
 
 DEFAULT_DATABASE_URL = "sqlite:///./configsync.db"
 
@@ -83,6 +89,18 @@ def create_app(
             checksum=version.checksum,
             content=load_payload(version.checksum),
             created_at=version.created_at,
+        )
+
+    def to_customer_state_response(
+        state_record: models.CustomerConfigState,
+    ) -> CustomerStateResponse:
+        return CustomerStateResponse(
+            customer=state_record.customer,
+            config_name=state_record.config_name,
+            applied_version=state_record.applied_version,
+            status=state_record.status,
+            error=state_record.error,
+            updated_at=state_record.updated_at,
         )
 
     @app.post(
@@ -196,7 +214,7 @@ def create_app(
         name: str,
         session: Session = Depends(get_session),
     ) -> ConfigResponse:
-        """Return the current config by resolving its artifact from storage."""
+        """Return the current desired config by resolving its artifact from storage."""
         config = session.get(models.Config, name)
         if config is None:
             raise HTTPException(
@@ -217,6 +235,60 @@ def create_app(
             )
 
         return to_response(name, version)
+
+    @app.put(
+        "/customers/{customer}/configs/{name}/status",
+        response_model=CustomerStateResponse,
+    )
+    def report_customer_state(
+        customer: str,
+        name: str,
+        payload: CustomerStateUpdate,
+        session: Session = Depends(get_session),
+    ) -> CustomerStateResponse:
+        """Record the actual state most recently observed by a customer agent."""
+        if session.get(models.Config, name) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Configuration '{name}' was not found",
+            )
+
+        state_record = session.get(models.CustomerConfigState, (customer, name))
+        if state_record is None:
+            state_record = models.CustomerConfigState(
+                customer=customer,
+                config_name=name,
+                applied_version=payload.applied_version,
+                status=payload.status,
+                error=payload.error,
+            )
+            session.add(state_record)
+        else:
+            state_record.applied_version = payload.applied_version
+            state_record.status = payload.status
+            state_record.error = payload.error
+
+        session.commit()
+        session.refresh(state_record)
+        return to_customer_state_response(state_record)
+
+    @app.get(
+        "/customers/{customer}/configs/{name}/status",
+        response_model=CustomerStateResponse,
+    )
+    def get_customer_state(
+        customer: str,
+        name: str,
+        session: Session = Depends(get_session),
+    ) -> CustomerStateResponse:
+        """Return the last actual state reported by a customer agent."""
+        state_record = session.get(models.CustomerConfigState, (customer, name))
+        if state_record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No state reported for customer '{customer}' and config '{name}'",
+            )
+        return to_customer_state_response(state_record)
 
     return app
 

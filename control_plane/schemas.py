@@ -24,3 +24,22 @@ class ConfigResponse(BaseModel):
     checksum: str
     content: dict[str, Any]
     created_at: datetime
+
+
+class CustomerStateUpdate(BaseModel):
+    """Actual state reported by a reconciliation agent."""
+
+    applied_version: int = Field(ge=0)
+    status: str = Field(min_length=1, max_length=32)
+    error: str | None = Field(default=None, max_length=500)
+
+
+class CustomerStateResponse(BaseModel):
+    """Last actual state reported for one customer/configuration pair."""
+
+    customer: str
+    config_name: str
+    applied_version: int
+    status: str
+    error: str | None
+    updated_at: datetime
