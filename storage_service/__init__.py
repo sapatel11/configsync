@@ -1,0 +1,1 @@
+"""ConfigSync artifact storage service."""

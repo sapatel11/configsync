@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from control_plane.database import Base
@@ -24,7 +24,7 @@ class Config(Base):
 
 
 class ConfigVersion(Base):
-    """An immutable snapshot of configuration content."""
+    """Immutable metadata for one configuration artifact version."""
 
     __tablename__ = "config_versions"
     __table_args__ = (
@@ -38,11 +38,10 @@ class ConfigVersion(Base):
         index=True,
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=utc_now,
     )
     config: Mapped[Config] = relationship(back_populates="versions")
-

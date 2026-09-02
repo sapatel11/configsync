@@ -21,5 +21,6 @@ class ConfigResponse(BaseModel):
 
     name: str
     version: int
+    checksum: str
     content: dict[str, Any]
     created_at: datetime

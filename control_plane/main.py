@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -9,18 +10,31 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from control_plane import models
+from control_plane.artifact_store import (
+    ArtifactStore,
+    ArtifactStoreError,
+    ReplicatedArtifactStore,
+)
 from control_plane.database import Base, create_database, session_scope
 from control_plane.schemas import ConfigCreate, ConfigResponse, ConfigUpdate
 
 DEFAULT_DATABASE_URL = "sqlite:///./configsync.db"
 
 
-def create_app(database_url: str | None = None) -> FastAPI:
-    """Build a control-plane app with an isolated database connection."""
+def serialize_content(content: dict) -> bytes:
+    return json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def create_app(
+    database_url: str | None = None,
+    artifact_store: ArtifactStore | None = None,
+) -> FastAPI:
+    """Build a control-plane app with isolated database and artifact storage."""
     resolved_database_url = database_url or os.getenv(
         "CONFIGSYNC_DATABASE_URL",
         DEFAULT_DATABASE_URL,
     )
+    resolved_artifact_store = artifact_store or ReplicatedArtifactStore.from_environment()
     engine, session_factory = create_database(resolved_database_url)
 
     @asynccontextmanager
@@ -34,6 +48,43 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def get_session() -> Iterator[Session]:
         yield from session_scope(session_factory)
 
+    def store_payload(content: dict) -> tuple[str, bytes]:
+        artifact = serialize_content(content)
+        checksum = hashlib.sha256(artifact).hexdigest()
+        try:
+            resolved_artifact_store.put(checksum, artifact)
+        except ArtifactStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Artifact replication failed",
+            ) from exc
+        return checksum, artifact
+
+    def load_payload(checksum: str) -> dict:
+        try:
+            artifact = resolved_artifact_store.get(checksum)
+        except ArtifactStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No valid artifact replica is available",
+            ) from exc
+
+        if hashlib.sha256(artifact).hexdigest() != checksum:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Artifact checksum validation failed",
+            )
+        return json.loads(artifact)
+
+    def to_response(name: str, version: models.ConfigVersion) -> ConfigResponse:
+        return ConfigResponse(
+            name=name,
+            version=version.version,
+            checksum=version.checksum,
+            content=load_payload(version.checksum),
+            created_at=version.created_at,
+        )
+
     @app.post(
         "/configs/{name}",
         response_model=ConfigResponse,
@@ -44,12 +95,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
         payload: ConfigCreate,
         session: Session = Depends(get_session),
     ) -> ConfigResponse:
-        """Create a named configuration at immutable version 1."""
+        """Create version 1 after replicating its artifact to both storage nodes."""
+        checksum, _ = store_payload(payload.content)
         config = models.Config(name=name, current_version=1)
         version = models.ConfigVersion(
             config_name=name,
             version=1,
-            content=json.dumps(payload.content, sort_keys=True),
+            checksum=checksum,
         )
         session.add_all([config, version])
 
@@ -63,12 +115,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
             ) from exc
 
         session.refresh(version)
-        return ConfigResponse(
-            name=name,
-            version=version.version,
-            content=json.loads(version.content),
-            created_at=version.created_at,
-        )
+        return to_response(name, version)
 
     @app.put("/configs/{name}", response_model=ConfigResponse)
     def update_config(
@@ -77,7 +124,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         if_match: str | None = Header(default=None, alias="If-Match"),
         session: Session = Depends(get_session),
     ) -> ConfigResponse:
-        """Create the next version only if the caller's version is current."""
+        """Replicate a new artifact and atomically advance its version pointer."""
         if if_match is None:
             raise HTTPException(
                 status_code=status.HTTP_428_PRECONDITION_REQUIRED,
@@ -98,6 +145,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 detail="If-Match must be a positive integer version",
             )
 
+        if session.get(models.Config, name) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Configuration '{name}' was not found",
+            )
+
+        checksum, _ = store_payload(payload.content)
         next_version = expected_version + 1
         result = session.execute(
             update(models.Config)
@@ -110,11 +164,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
         if result.rowcount != 1:
             session.rollback()
-            if session.get(models.Config, name) is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Configuration '{name}' was not found",
-                )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -126,7 +175,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         version = models.ConfigVersion(
             config_name=name,
             version=next_version,
-            content=json.dumps(payload.content, sort_keys=True),
+            checksum=checksum,
         )
         session.add(version)
 
@@ -140,19 +189,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
             ) from exc
 
         session.refresh(version)
-        return ConfigResponse(
-            name=name,
-            version=version.version,
-            content=json.loads(version.content),
-            created_at=version.created_at,
-        )
+        return to_response(name, version)
 
     @app.get("/configs/{name}", response_model=ConfigResponse)
     def get_config(
         name: str,
         session: Session = Depends(get_session),
     ) -> ConfigResponse:
-        """Return the authoritative current version of a configuration."""
+        """Return the current config by resolving its artifact from storage."""
         config = session.get(models.Config, name)
         if config is None:
             raise HTTPException(
@@ -172,12 +216,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 detail="Current configuration version is missing",
             )
 
-        return ConfigResponse(
-            name=name,
-            version=version.version,
-            content=json.loads(version.content),
-            created_at=version.created_at,
-        )
+        return to_response(name, version)
 
     return app
 
