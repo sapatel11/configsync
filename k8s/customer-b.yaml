@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-state
+  namespace: customer-b
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 128Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: configsync-agent
+  namespace: customer-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: configsync-agent
+  template:
+    metadata:
+      labels:
+        app: configsync-agent
+        customer: customer-b
+    spec:
+      containers:
+        - name: agent
+          image: configsync:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "agent.main"]
+          env:
+            - name: CONFIGSYNC_CUSTOMER
+              value: customer-b
+            - name: CONFIGSYNC_CONFIG
+              value: firewall
+            - name: CONFIGSYNC_CONTROL_PLANE
+              value: http://control-plane.configsync.svc.cluster.local:8000
+            - name: CONFIGSYNC_AGENT_STATE_DIR
+              value: /state
+            - name: CONFIGSYNC_POLL_INTERVAL_SECONDS
+              value: "2"
+          volumeMounts:
+            - name: state
+              mountPath: /state
+          resources:
+            requests:
+              cpu: 20m
+              memory: 48Mi
+            limits:
+              cpu: 200m
+              memory: 192Mi
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: agent-state
