@@ -16,12 +16,14 @@ from control_plane.artifact_store import (
     ReplicatedArtifactStore,
 )
 from control_plane.database import Base, create_database, session_scope
+from control_plane.rollout import RolloutConflict, RolloutCoordinator
 from control_plane.schemas import (
     ConfigCreate,
     ConfigResponse,
     ConfigUpdate,
     CustomerStateResponse,
     CustomerStateUpdate,
+    RolloutResponse,
 )
 
 DEFAULT_DATABASE_URL = "sqlite:///./configsync.db"
@@ -34,6 +36,8 @@ def serialize_content(content: dict) -> bytes:
 def create_app(
     database_url: str | None = None,
     artifact_store: ArtifactStore | None = None,
+    rollout_timeout_seconds: float = 8.0,
+    rollout_poll_interval_seconds: float = 0.1,
 ) -> FastAPI:
     """Build a control-plane app with isolated database and artifact storage."""
     resolved_database_url = database_url or os.getenv(
@@ -42,6 +46,11 @@ def create_app(
     )
     resolved_artifact_store = artifact_store or ReplicatedArtifactStore.from_environment()
     engine, session_factory = create_database(resolved_database_url)
+    rollout_coordinator = RolloutCoordinator(
+        session_factory,
+        timeout_seconds=rollout_timeout_seconds,
+        poll_interval_seconds=rollout_poll_interval_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -54,7 +63,7 @@ def create_app(
     def get_session() -> Iterator[Session]:
         yield from session_scope(session_factory)
 
-    def store_payload(content: dict) -> tuple[str, bytes]:
+    def store_payload(content: dict) -> str:
         artifact = serialize_content(content)
         checksum = hashlib.sha256(artifact).hexdigest()
         try:
@@ -64,7 +73,7 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Artifact replication failed",
             ) from exc
-        return checksum, artifact
+        return checksum
 
     def load_payload(checksum: str) -> dict:
         try:
@@ -81,6 +90,39 @@ def create_app(
                 detail="Artifact checksum validation failed",
             )
         return json.loads(artifact)
+
+    def get_version_record(
+        session: Session,
+        name: str,
+        version_number: int,
+    ) -> models.ConfigVersion:
+        version = session.scalar(
+            select(models.ConfigVersion).where(
+                models.ConfigVersion.config_name == name,
+                models.ConfigVersion.version == version_number,
+            )
+        )
+        if version is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Configuration version metadata is missing",
+            )
+        return version
+
+    def get_stable_state(
+        session: Session,
+        config: models.Config,
+    ) -> models.ConfigDesiredState:
+        desired = session.get(models.ConfigDesiredState, config.name)
+        if desired is None:
+            desired = models.ConfigDesiredState(
+                config_name=config.name,
+                stable_version=config.current_version,
+            )
+            session.add(desired)
+            session.commit()
+            session.refresh(desired)
+        return desired
 
     def to_response(name: str, version: models.ConfigVersion) -> ConfigResponse:
         return ConfigResponse(
@@ -103,6 +145,18 @@ def create_app(
             updated_at=state_record.updated_at,
         )
 
+    def to_rollout_response(rollout: models.Rollout) -> RolloutResponse:
+        return RolloutResponse(
+            id=rollout.id,
+            config_name=rollout.config_name,
+            target_version=rollout.target_version,
+            previous_version=rollout.previous_version,
+            status=rollout.status,
+            error=rollout.error,
+            created_at=rollout.created_at,
+            updated_at=rollout.updated_at,
+        )
+
     @app.post(
         "/configs/{name}",
         response_model=ConfigResponse,
@@ -113,15 +167,16 @@ def create_app(
         payload: ConfigCreate,
         session: Session = Depends(get_session),
     ) -> ConfigResponse:
-        """Create version 1 after replicating its artifact to both storage nodes."""
-        checksum, _ = store_payload(payload.content)
+        """Create version 1 and make it the initial stable desired version."""
+        checksum = store_payload(payload.content)
         config = models.Config(name=name, current_version=1)
         version = models.ConfigVersion(
             config_name=name,
             version=1,
             checksum=checksum,
         )
-        session.add_all([config, version])
+        desired = models.ConfigDesiredState(config_name=name, stable_version=1)
+        session.add_all([config, version, desired])
 
         try:
             session.commit()
@@ -142,7 +197,7 @@ def create_app(
         if_match: str | None = Header(default=None, alias="If-Match"),
         session: Session = Depends(get_session),
     ) -> ConfigResponse:
-        """Replicate a new artifact and atomically advance its version pointer."""
+        """Create a candidate version without immediately exposing it to all agents."""
         if if_match is None:
             raise HTTPException(
                 status_code=status.HTTP_428_PRECONDITION_REQUIRED,
@@ -169,7 +224,7 @@ def create_app(
                 detail=f"Configuration '{name}' was not found",
             )
 
-        checksum, _ = store_payload(payload.content)
+        checksum = store_payload(payload.content)
         next_version = expected_version + 1
         result = session.execute(
             update(models.Config)
@@ -214,7 +269,28 @@ def create_app(
         name: str,
         session: Session = Depends(get_session),
     ) -> ConfigResponse:
-        """Return the current desired config by resolving its artifact from storage."""
+        """Return the newest configuration version, including an unrolled candidate."""
+        config = session.get(models.Config, name)
+        if config is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Configuration '{name}' was not found",
+            )
+        return to_response(
+            name,
+            get_version_record(session, name, config.current_version),
+        )
+
+    @app.get(
+        "/customers/{customer}/configs/{name}/desired",
+        response_model=ConfigResponse,
+    )
+    def get_customer_desired_config(
+        customer: str,
+        name: str,
+        session: Session = Depends(get_session),
+    ) -> ConfigResponse:
+        """Return the customer-specific rollout target or the stable version."""
         config = session.get(models.Config, name)
         if config is None:
             raise HTTPException(
@@ -222,19 +298,15 @@ def create_app(
                 detail=f"Configuration '{name}' was not found",
             )
 
-        version = session.scalar(
-            select(models.ConfigVersion).where(
-                models.ConfigVersion.config_name == name,
-                models.ConfigVersion.version == config.current_version,
-            )
+        target = session.get(models.CustomerConfigTarget, (customer, name))
+        if target is not None:
+            desired_version = target.desired_version
+        else:
+            desired_version = get_stable_state(session, config).stable_version
+        return to_response(
+            name,
+            get_version_record(session, name, desired_version),
         )
-        if version is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Current configuration version is missing",
-            )
-
-        return to_response(name, version)
 
     @app.put(
         "/customers/{customer}/configs/{name}/status",
@@ -289,6 +361,36 @@ def create_app(
                 detail=f"No state reported for customer '{customer}' and config '{name}'",
             )
         return to_customer_state_response(state_record)
+
+    @app.post("/rollouts/{name}", response_model=RolloutResponse)
+    def start_rollout(name: str) -> RolloutResponse:
+        """Roll the newest candidate through customer-a before customer-b."""
+        try:
+            rollout = rollout_coordinator.run(name)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Configuration '{name}' was not found",
+            ) from exc
+        except RolloutConflict as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return to_rollout_response(rollout)
+
+    @app.get("/rollouts/{rollout_id}", response_model=RolloutResponse)
+    def get_rollout(
+        rollout_id: int,
+        session: Session = Depends(get_session),
+    ) -> RolloutResponse:
+        rollout = session.get(models.Rollout, rollout_id)
+        if rollout is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Rollout {rollout_id} was not found",
+            )
+        return to_rollout_response(rollout)
 
     return app
 
