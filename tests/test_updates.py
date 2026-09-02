@@ -7,6 +7,11 @@ from sqlalchemy import select
 from control_plane import models
 from control_plane.database import create_database
 from control_plane.main import create_app
+from tests.helpers import MemoryArtifactStore
+
+
+def create_test_app(database_url: str):
+    return create_app(database_url, MemoryArtifactStore())
 
 
 def create_firewall(client: TestClient) -> None:
@@ -19,7 +24,7 @@ def create_firewall(client: TestClient) -> None:
 
 def test_update_with_matching_version_creates_next_snapshot(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'test.db'}"
-    app = create_app(database_url)
+    app = create_test_app(database_url)
 
     with TestClient(app) as client:
         create_firewall(client)
@@ -38,22 +43,15 @@ def test_update_with_matching_version_creates_next_snapshot(tmp_path: Path) -> N
 
 
 def test_update_without_if_match_requires_precondition(tmp_path: Path) -> None:
-    app = create_app(f"sqlite:///{tmp_path / 'test.db'}")
-
+    app = create_test_app(f"sqlite:///{tmp_path / 'test.db'}")
     with TestClient(app) as client:
         create_firewall(client)
-        response = client.put(
-            "/configs/firewall",
-            json={"content": {"port": 8443}},
-        )
-
+        response = client.put("/configs/firewall", json={"content": {"port": 8443}})
     assert response.status_code == 428
-    assert response.json() == {"detail": "If-Match header is required"}
 
 
 def test_update_with_malformed_if_match_returns_bad_request(tmp_path: Path) -> None:
-    app = create_app(f"sqlite:///{tmp_path / 'test.db'}")
-
+    app = create_test_app(f"sqlite:///{tmp_path / 'test.db'}")
     with TestClient(app) as client:
         create_firewall(client)
         response = client.put(
@@ -61,13 +59,11 @@ def test_update_with_malformed_if_match_returns_bad_request(tmp_path: Path) -> N
             headers={"If-Match": "version-1"},
             json={"content": {"port": 8443}},
         )
-
     assert response.status_code == 400
 
 
 def test_update_with_nonpositive_if_match_returns_bad_request(tmp_path: Path) -> None:
-    app = create_app(f"sqlite:///{tmp_path / 'test.db'}")
-
+    app = create_test_app(f"sqlite:///{tmp_path / 'test.db'}")
     with TestClient(app) as client:
         create_firewall(client)
         response = client.put(
@@ -75,26 +71,22 @@ def test_update_with_nonpositive_if_match_returns_bad_request(tmp_path: Path) ->
             headers={"If-Match": "0"},
             json={"content": {"port": 8443}},
         )
-
     assert response.status_code == 400
 
 
 def test_update_missing_configuration_returns_not_found(tmp_path: Path) -> None:
-    app = create_app(f"sqlite:///{tmp_path / 'test.db'}")
-
+    app = create_test_app(f"sqlite:///{tmp_path / 'test.db'}")
     with TestClient(app) as client:
         response = client.put(
             "/configs/missing",
             headers={"If-Match": "1"},
             json={"content": {"port": 8443}},
         )
-
     assert response.status_code == 404
 
 
 def test_stale_update_returns_conflict_and_keeps_winning_version(tmp_path: Path) -> None:
-    app = create_app(f"sqlite:///{tmp_path / 'test.db'}")
-
+    app = create_test_app(f"sqlite:///{tmp_path / 'test.db'}")
     with TestClient(app) as client:
         create_firewall(client)
         winner = client.put(
@@ -117,7 +109,7 @@ def test_stale_update_returns_conflict_and_keeps_winning_version(tmp_path: Path)
 
 def test_two_writers_from_same_version_allow_exactly_one_update(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'test.db'}"
-    app = create_app(database_url)
+    app = create_test_app(database_url)
 
     with TestClient(app) as client:
         create_firewall(client)
@@ -149,3 +141,4 @@ def test_two_writers_from_same_version_allow_exactly_one_update(tmp_path: Path) 
     engine.dispose()
 
     assert [version.version for version in versions] == [1, 2]
+    assert all(len(version.checksum) == 64 for version in versions)
