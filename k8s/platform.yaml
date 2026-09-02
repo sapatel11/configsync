@@ -1,0 +1,297 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-a-data
+  namespace: configsync
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-b-data
+  namespace: configsync
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: control-plane-data
+  namespace: configsync
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage-a
+  namespace: configsync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: storage-a
+  template:
+    metadata:
+      labels:
+        app: storage-a
+    spec:
+      containers:
+        - name: storage-a
+          image: configsync:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "uvicorn", "storage_service.main:app", "--host", "0.0.0.0", "--port", "8101"]
+          env:
+            - name: CONFIGSYNC_STORAGE_DIR
+              value: /data
+          ports:
+            - containerPort: 8101
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8101
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8101
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: storage-a-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-a
+  namespace: configsync
+spec:
+  selector:
+    app: storage-a
+  ports:
+    - port: 8101
+      targetPort: 8101
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage-b
+  namespace: configsync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: storage-b
+  template:
+    metadata:
+      labels:
+        app: storage-b
+    spec:
+      containers:
+        - name: storage-b
+          image: configsync:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "uvicorn", "storage_service.main:app", "--host", "0.0.0.0", "--port", "8101"]
+          env:
+            - name: CONFIGSYNC_STORAGE_DIR
+              value: /data
+          ports:
+            - containerPort: 8101
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8101
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8101
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: storage-b-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-b
+  namespace: configsync
+spec:
+  selector:
+    app: storage-b
+  ports:
+    - port: 8101
+      targetPort: 8101
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: configsync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: control-plane
+  template:
+    metadata:
+      labels:
+        app: control-plane
+    spec:
+      containers:
+        - name: control-plane
+          image: configsync:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "uvicorn", "control_plane.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          env:
+            - name: CONFIGSYNC_DATABASE_URL
+              value: sqlite:////data/configsync.db
+            - name: CONFIGSYNC_STORAGE_NODES
+              value: http://storage-a:8101,http://storage-b:8101
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            initialDelaySeconds: 8
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: control-plane-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: configsync
+spec:
+  selector:
+    app: control-plane
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: configsync
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+      - job_name: configsync-control-plane
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - control-plane.configsync.svc.cluster.local:8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: configsync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.5.0
+          args: ["--config.file=/etc/prometheus/prometheus.yml"]
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: configsync
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
