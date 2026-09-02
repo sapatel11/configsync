@@ -1,0 +1,113 @@
+services:
+  storage-a:
+    build: .
+    image: configsync:local
+    command: ["python", "-m", "uvicorn", "storage_service.main:app", "--host", "0.0.0.0", "--port", "8101"]
+    environment:
+      CONFIGSYNC_STORAGE_DIR: /data
+    volumes:
+      - storage-a-data:/data
+    ports:
+      - "8101:8101"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8101/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  storage-b:
+    build: .
+    image: configsync:local
+    command: ["python", "-m", "uvicorn", "storage_service.main:app", "--host", "0.0.0.0", "--port", "8101"]
+    environment:
+      CONFIGSYNC_STORAGE_DIR: /data
+    volumes:
+      - storage-b-data:/data
+    ports:
+      - "8102:8101"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8101/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  control-plane:
+    build: .
+    image: configsync:local
+    command: ["python", "-m", "uvicorn", "control_plane.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      CONFIGSYNC_DATABASE_URL: sqlite:////data/configsync.db
+      CONFIGSYNC_STORAGE_NODES: http://storage-a:8101,http://storage-b:8101
+    volumes:
+      - control-plane-data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      storage-a:
+        condition: service_healthy
+      storage-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/metrics', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  agent-a:
+    build: .
+    image: configsync:local
+    command: ["python", "-m", "agent.main"]
+    environment:
+      CONFIGSYNC_CUSTOMER: customer-a
+      CONFIGSYNC_CONFIG: firewall
+      CONFIGSYNC_CONTROL_PLANE: http://control-plane:8000
+      CONFIGSYNC_AGENT_STATE_DIR: /state
+      CONFIGSYNC_POLL_INTERVAL_SECONDS: "2"
+    volumes:
+      - agent-a-state:/state
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent-b:
+    build: .
+    image: configsync:local
+    command: ["python", "-m", "agent.main"]
+    environment:
+      CONFIGSYNC_CUSTOMER: customer-b
+      CONFIGSYNC_CONFIG: firewall
+      CONFIGSYNC_CONTROL_PLANE: http://control-plane:8000
+      CONFIGSYNC_AGENT_STATE_DIR: /state
+      CONFIGSYNC_POLL_INTERVAL_SECONDS: "2"
+    volumes:
+      - agent-b-state:/state
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  storage-a-data:
+  storage-b-data:
+  control-plane-data:
+  agent-a-state:
+  agent-b-state:
