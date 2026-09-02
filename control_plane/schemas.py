@@ -10,6 +10,12 @@ class ConfigCreate(BaseModel):
     content: dict[str, Any] = Field(min_length=1)
 
 
+class ConfigUpdate(BaseModel):
+    """Configuration content accepted when creating a new version."""
+
+    content: dict[str, Any] = Field(min_length=1)
+
+
 class ConfigResponse(BaseModel):
     """The current authoritative configuration version."""
 
@@ -17,4 +23,3 @@ class ConfigResponse(BaseModel):
     version: int
     content: dict[str, Any]
     created_at: datetime
-
