@@ -4,17 +4,23 @@ ConfigSync is a compact distributed configuration rollout service. It is built
 incrementally to demonstrate versioned desired state, optimistic concurrency,
 replicated artifact storage, reconciliation, canary rollout, and rollback.
 
-## Phase 1: minimal control plane
+## Phase 2: optimistic concurrency
 
-The current phase provides a FastAPI control plane backed by SQLite. It can:
+The current control plane is backed by SQLite. It can:
 
 - create a named configuration at version 1;
 - retrieve the authoritative current version;
-- reject duplicate configuration names with `409 Conflict`.
+- reject duplicate configuration names with `409 Conflict`;
+- update a configuration only when the caller supplies the current version in
+  `If-Match`;
+- return `409 Conflict` for stale writers so concurrent updates cannot silently
+  overwrite each other.
 
-Configuration content is temporarily stored in SQLite. A later phase will move
-artifacts to two replicated storage services while keeping authoritative metadata
-in the control-plane database.
+The mutable `Config.current_version` pointer and the immutable next
+`ConfigVersion` snapshot are updated in one database transaction. Configuration
+content is still stored in SQLite for now; a later phase will move artifacts to
+two replicated storage services while keeping authoritative metadata in the
+control-plane database.
 
 ## Local setup
 
@@ -53,3 +59,25 @@ Retrieve it:
 Invoke-RestMethod -Uri http://127.0.0.1:8000/configs/firewall
 ```
 
+Update version 1 to version 2:
+
+```powershell
+$updatedBody = @{
+    content = @{
+        service = "firewall"
+        port = 8443
+        enabled = $true
+    }
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Method Put `
+    -Uri http://127.0.0.1:8000/configs/firewall `
+    -Headers @{ "If-Match" = "1" } `
+    -ContentType application/json `
+    -Body $updatedBody
+```
+
+Repeat the same request with `If-Match: 1`. Because the current version is now
+2, the stale request returns `409 Conflict` instead of overwriting the winning
+update.
