@@ -24,7 +24,7 @@ def validate_config(content: dict) -> None:
 
 
 class ConfigSyncAgent:
-    """Poll desired state and converge local state toward it."""
+    """Poll customer-specific desired state and converge local state toward it."""
 
     def __init__(
         self,
@@ -89,7 +89,8 @@ class ConfigSyncAgent:
         applied_version = self.current_version()
         try:
             response = self.client.get(
-                f"{self.control_plane_url}/configs/{self.config_name}"
+                f"{self.control_plane_url}/customers/{self.customer}/configs/"
+                f"{self.config_name}/desired"
             )
             response.raise_for_status()
             desired = response.json()

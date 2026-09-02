@@ -17,7 +17,7 @@ class ConfigUpdate(BaseModel):
 
 
 class ConfigResponse(BaseModel):
-    """The current authoritative configuration version."""
+    """One immutable configuration version and its resolved artifact."""
 
     name: str
     version: int
@@ -42,4 +42,17 @@ class CustomerStateResponse(BaseModel):
     applied_version: int
     status: str
     error: str | None
+    updated_at: datetime
+
+
+class RolloutResponse(BaseModel):
+    """Result of one staged rollout attempt."""
+
+    id: int
+    config_name: str
+    target_version: int
+    previous_version: int
+    status: str
+    error: str | None
+    created_at: datetime
     updated_at: datetime
