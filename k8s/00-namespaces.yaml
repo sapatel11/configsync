@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: configsync
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: customer-a
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: customer-b
