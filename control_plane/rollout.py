@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from control_plane import models
+from control_plane.metrics import ConfigSyncMetrics
 
 
 ACTIVE_ROLLOUT_STATUSES = ("canary", "rolling_out")
@@ -23,12 +24,14 @@ class RolloutCoordinator:
         remaining_customers: tuple[str, ...] = ("customer-b",),
         timeout_seconds: float = 8.0,
         poll_interval_seconds: float = 0.1,
+        metrics: ConfigSyncMetrics | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.canary_customer = canary_customer
         self.remaining_customers = remaining_customers
         self.timeout_seconds = timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
+        self.metrics = metrics
 
     def _stable_state(
         self,
@@ -115,6 +118,9 @@ class RolloutCoordinator:
         previous_version: int,
         error: str,
     ) -> models.Rollout:
+        if self.metrics is not None:
+            self.metrics.rollout_failures_total.inc()
+            self.metrics.rollbacks_total.inc()
         with self.session_factory() as session:
             for customer in customers:
                 self._set_target(session, customer, config_name, previous_version)
@@ -158,6 +164,9 @@ class RolloutCoordinator:
             session.commit()
             session.refresh(rollout)
             rollout_id = rollout.id
+
+        if self.metrics is not None:
+            self.metrics.rollouts_total.inc()
 
         healthy, error = self._wait_for_customer(
             self.canary_customer,
