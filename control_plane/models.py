@@ -11,7 +11,7 @@ def utc_now() -> datetime:
 
 
 class Config(Base):
-    """Authoritative pointer to a configuration's current version."""
+    """Authoritative pointer to the newest immutable configuration version."""
 
     __tablename__ = "configs"
 
@@ -47,6 +47,28 @@ class ConfigVersion(Base):
     config: Mapped[Config] = relationship(back_populates="versions")
 
 
+class ConfigDesiredState(Base):
+    """Stable version used when a customer has no rollout-specific target."""
+
+    __tablename__ = "config_desired_states"
+
+    config_name: Mapped[str] = mapped_column(
+        ForeignKey("configs.name"),
+        primary_key=True,
+    )
+    stable_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class CustomerConfigTarget(Base):
+    """Per-customer desired version used to stage a rollout."""
+
+    __tablename__ = "customer_config_targets"
+
+    customer: Mapped[str] = mapped_column(String(120), primary_key=True)
+    config_name: Mapped[str] = mapped_column(String(120), primary_key=True)
+    desired_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class CustomerConfigState(Base):
     """Last actual configuration state reported by a customer agent."""
 
@@ -57,6 +79,30 @@ class CustomerConfigState(Base):
     applied_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+
+class Rollout(Base):
+    """One health-gated staged rollout attempt."""
+
+    __tablename__ = "rollouts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    config_name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    target_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
